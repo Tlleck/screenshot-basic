@@ -26,20 +26,18 @@ class ScreenshotRequest {
     targetField: string;
 }
 
-// from https://stackoverflow.com/a/12300351
+// Compatibility fallback for older CEF builds without canvas.toBlob().
 function dataURItoBlob(dataURI: string) {
     const byteString = atob(dataURI.split(',')[1]);
-    const mimeString = dataURI.split(',')[0].split(':')[1].split(';')[0]
-
+    const mimeString = dataURI.split(',')[0].split(':')[1].split(';')[0];
     const ab = new ArrayBuffer(byteString.length);
     const ia = new Uint8Array(ab);
-  
+
     for (let i = 0; i < byteString.length; i++) {
         ia[i] = byteString.charCodeAt(i);
     }
-  
-    const blob = new Blob([ab], {type: mimeString});
-    return blob;
+
+    return new Blob([ab], {type: mimeString});
 }
 
 class ScreenshotUI {
@@ -48,11 +46,25 @@ class ScreenshotUI {
     sceneRTT: any;
     cameraRTT: any;
     material: any;
-    request: ScreenshotRequest;
+    requestQueue: ScreenshotRequest[] = [];
+    captureScheduled: boolean = false;
+    captureWidth: number = 0;
+    captureHeight: number = 0;
+    readBuffer: Uint8Array;
+    canvas: HTMLCanvasElement;
+    canvasContext: CanvasRenderingContext2D;
+    imageData: ImageData;
 
     initialize() {
         window.addEventListener('message', event => {
-            this.request = event.data.request;
+            const request = event.data && event.data.request;
+
+            if (!request) {
+                return;
+            }
+
+            this.requestQueue.push(request);
+            this.scheduleCapture();
         });
 
         window.addEventListener('resize', event => {
@@ -109,13 +121,14 @@ class ScreenshotUI {
         this.rtTexture = rtTexture;
         this.sceneRTT = sceneRTT;
         this.cameraRTT = cameraRTT;
-
-        this.animate = this.animate.bind(this);
-
-        requestAnimationFrame(this.animate);
+        this.captureWidth = window.innerWidth;
+        this.captureHeight = window.innerHeight;
     }
 
     resize() {
+        this.captureWidth = window.innerWidth;
+        this.captureHeight = window.innerHeight;
+
         const cameraRTT: any = new OrthographicCamera( window.innerWidth / -2, window.innerWidth / 2, window.innerHeight / 2, window.innerHeight / -2, -10000, 10000 );
         cameraRTT.position.z = 100;
 
@@ -130,41 +143,135 @@ class ScreenshotUI {
 
         this.sceneRTT = sceneRTT;
 
+        if (this.rtTexture && this.rtTexture.dispose) {
+            this.rtTexture.dispose();
+        }
+
         this.rtTexture = new WebGLRenderTarget( window.innerWidth, window.innerHeight, { minFilter: LinearFilter, magFilter: NearestFilter, format: RGBAFormat, type: UnsignedByteType } );
+
+        this.readBuffer = null;
+        this.imageData = null;
 
         this.renderer.setSize( window.innerWidth, window.innerHeight );
     }
 
+    scheduleCapture() {
+        // Keep the NUI idle when there is no screenshot request. The old
+        // implementation rendered the game texture every animation frame,
+        // which consumed GPU time even while the resource was unused.
+        if (this.captureScheduled) {
+            return;
+        }
+
+        this.captureScheduled = true;
+
+        requestAnimationFrame(() => {
+            this.captureScheduled = false;
+
+            const request = this.requestQueue.shift();
+
+            if (!request) {
+                return;
+            }
+
+            this.renderer.clear();
+            this.renderer.render(this.sceneRTT, this.cameraRTT, this.rtTexture, true);
+
+            // Let the browser/GPU finish the render before the readback. A
+            // readRenderTargetPixels immediately after render forces a hard
+            // GPU/CPU synchronization and is the biggest source of the FPS
+            // hitch during a screenshot request.
+            requestAnimationFrame(() => {
+                this.handleRequest(request, () => {
+                    if (this.requestQueue.length > 0) {
+                        this.scheduleCapture();
+                    }
+                });
+            });
+        });
+    }
+
     animate() {
-        requestAnimationFrame(this.animate);
+        // Kept as a compatibility shim for code that may call this method
+        // directly. Captures are now scheduled only when requested.
+        this.scheduleCapture();
+    }
 
-        this.renderer.clear();
-        this.renderer.render(this.sceneRTT, this.cameraRTT, this.rtTexture, true);
+    getCanvasContext() {
+        if (!this.canvas) {
+            this.canvas = document.createElement('canvas');
+            this.canvas.style.display = 'inline';
+            this.canvasContext = this.canvas.getContext('2d');
+        }
 
-        if (this.request) {
-            const request = this.request;
-            this.request = null;
+        if (this.canvas.width !== this.captureWidth || this.canvas.height !== this.captureHeight) {
+            this.canvas.width = this.captureWidth;
+            this.canvas.height = this.captureHeight;
+            this.imageData = this.canvasContext.createImageData(this.captureWidth, this.captureHeight);
+        }
 
-            this.handleRequest(request);
+        return this.canvasContext;
+    }
+
+    sendResult(request: ScreenshotRequest, text: string) {
+        if (request.resultURL) {
+            fetch(request.resultURL, {
+                method: 'POST',
+                mode: 'cors',
+                body: JSON.stringify({
+                    data: text,
+                    id: request.correlation
+                })
+            });
         }
     }
 
-    handleRequest(request: ScreenshotRequest) {
-        // read the screenshot
-        const read = new Uint8Array(window.innerWidth * window.innerHeight * 4);
-        this.renderer.readRenderTargetPixels(this.rtTexture, 0, 0, window.innerWidth, window.innerHeight, read);
+    uploadBlob(request: ScreenshotRequest, blob: Blob) {
+        const formData = new FormData();
+        formData.append(request.targetField, blob, `screenshot.${request.encoding}`);
 
-        // create a temporary canvas to compress the image
-        const canvas = document.createElement('canvas');
-        canvas.style.display = 'inline';
-        canvas.width = window.innerWidth;
-        canvas.height = window.innerHeight;
+        fetch(request.targetURL, {
+            method: 'POST',
+            mode: 'cors',
+            headers: request.headers,
+            body: formData
+        })
+        .then(response => response.text())
+        .then(text => this.sendResult(request, text));
+    }
+
+    sendDataURI(request: ScreenshotRequest, imageURL: string) {
+        fetch(request.targetURL, {
+            method: 'POST',
+            mode: 'cors',
+            headers: request.headers,
+            body: JSON.stringify({
+                data: imageURL,
+                id: request.correlation
+            })
+        })
+        .then(response => response.text())
+        .then(text => this.sendResult(request, text));
+    }
+
+    encodeDataURI(request: ScreenshotRequest, type: string) {
+        const imageURL = this.canvas.toDataURL(type, request.quality);
+
+        if (request.targetField) {
+            this.uploadBlob(request, dataURItoBlob(imageURL));
+            return;
+        }
+
+        this.sendDataURI(request, imageURL);
+    }
+
+    processPixels(request: ScreenshotRequest, done?: () => void) {
+        // Prepare the reusable canvas to compress the image.
+        const cxt = this.getCanvasContext();
 
         // draw the image on the canvas
-        const d = new Uint8ClampedArray(read.buffer);
-
-        const cxt = canvas.getContext('2d');
-        cxt.putImageData(new ImageData(d, window.innerWidth, window.innerHeight), 0, 0);
+        this.imageData.data.set(this.readBuffer);
+        cxt.putImageData(this.imageData, 0, 0);
 
         // encode the image
         let type = 'image/png';
@@ -185,39 +292,93 @@ class ScreenshotUI {
             request.quality = 0.92;
         }
 
-        // actual encoding
-        const imageURL = canvas.toDataURL(type, request.quality);
+        // actual encoding. toBlob keeps image encoding off the synchronous
+        // request path. Uploads can use the Blob directly; only the legacy
+        // requestScreenshot API needs an additional asynchronous Data URI.
+        const onBlob = (blob: Blob) => {
+            if (!blob) {
+                this.encodeDataURI(request, type);
+                if (done) {
+                    done();
+                }
+                return;
+            }
 
-        const getFormData = () => {
-            const formData = new FormData();
-            formData.append(request.targetField, dataURItoBlob(imageURL), `screenshot.${request.encoding}`);
+            if (request.targetField) {
+                this.uploadBlob(request, blob);
+                if (done) {
+                    done();
+                }
+                return;
+            }
 
-            return formData;
+            const reader = new FileReader();
+            reader.onload = () => {
+                this.sendDataURI(request, <string>reader.result);
+                if (done) {
+                    done();
+                }
+            };
+            reader.onerror = () => {
+                if (done) {
+                    done();
+                }
+            };
+            reader.readAsDataURL(blob);
         };
 
-        // upload the image somewhere
-        fetch(request.targetURL, {
-            method: 'POST',
-            mode: 'cors',
-            headers: request.headers,
-            body: (request.targetField) ? getFormData() : JSON.stringify({
-                data: imageURL,
-                id: request.correlation
-            })
-        })
-        .then(response => response.text())
-        .then(text => {
-            if (request.resultURL) {
-                fetch(request.resultURL, {
-                    method: 'POST',
-                    mode: 'cors',
-                    body: JSON.stringify({
-                        data: text,
-                        id: request.correlation
-                    })
-                });
+        if (this.canvas.toBlob) {
+            this.canvas.toBlob(onBlob, type, request.quality);
+        } else {
+            this.encodeDataURI(request, type);
+            if (done) {
+                done();
             }
-        });
+        }
+    }
+
+    handleRequest(request: ScreenshotRequest, done?: () => void) {
+        // read the screenshot
+        const bufferSize = this.captureWidth * this.captureHeight * 4;
+
+        if (!this.readBuffer || this.readBuffer.length !== bufferSize) {
+            this.readBuffer = new Uint8Array(bufferSize);
+        }
+
+        const finish = (buffer?: Uint8Array) => {
+            if (buffer && buffer !== this.readBuffer) {
+                this.readBuffer = buffer;
+            }
+
+            this.processPixels(request, done);
+        };
+
+        // Newer Three.js versions expose a non-blocking readback. The
+        // bundled @citizenfx/three is older, so the synchronous fallback is
+        // retained for existing FiveM installations.
+        if (typeof this.renderer.readRenderTargetPixelsAsync === 'function') {
+            try {
+                Promise.resolve(this.renderer.readRenderTargetPixelsAsync(
+                    this.rtTexture,
+                    0,
+                    0,
+                    this.captureWidth,
+                    this.captureHeight,
+                    this.readBuffer
+                ))
+                .then((buffer: Uint8Array) => finish(buffer))
+                .catch(() => {
+                    this.renderer.readRenderTargetPixels(this.rtTexture, 0, 0, this.captureWidth, this.captureHeight, this.readBuffer);
+                    finish();
+                });
+                return;
+            } catch (e) {
+                // Fall through to the legacy synchronous implementation.
+            }
+        }
+
+        this.renderer.readRenderTargetPixels(this.rtTexture, 0, 0, this.captureWidth, this.captureHeight, this.readBuffer);
+        finish();
     }
 }
 
