@@ -1,7 +1,7 @@
 {
-  "version": "1.0.0",
+  "version": "1.0.3",
   "required": true,
   "min_updater_version": "1.0.0",
-  "package": "releases/1.0.0/PMC_Ponto_Checker_1.0.0.zip",
-  "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  "package": "releases/1.0.3/PMC_Ponto_Checker_1.0.3.zip",
+  "sha256": "eb663a3ce99c9aeefa6bebeb87962bdc3e7ce111fc922c756406b211c9b7810c"
 }
