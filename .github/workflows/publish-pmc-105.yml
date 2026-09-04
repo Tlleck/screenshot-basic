@@ -1,0 +1,59 @@
+name: Publish PMC Update 1.0.5
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - '.github/workflows/publish-pmc-105.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download built update artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $url='https://sdmntprbrazilsouth.oaiusercontent.com/files/00000000-0248-820e-9d58-15ddfa512754/raw?se=2026-09-04T02%3A26%3A20Z&sp=r&sv=2026-02-06&sr=b&scid=80162f10-de14-5988-aabf-95438dae4eee&skoid=68f37fa7-4e08-478b-93f3-c72d563a0ab3&sktid=a48cca56-e6da-484e-a814-9c849652bcb3&skt=2026-09-03T20%3A51%3A32Z&ske=2026-09-04T20%3A51%3A32Z&sks=b&skv=2026-02-06&sig=bZgQKE0V78S3LrlCQdVcOHzqm84Vrx7YDwL85zd0b2U%3D'
+          Invoke-WebRequest -Uri $url -OutFile artifact.zip -UseBasicParsing
+          Expand-Archive artifact.zip -DestinationPath artifact -Force
+          Get-ChildItem artifact -Force
+          if (-not (Test-Path 'artifact\PMC_Ponto_Checker_1.0.5.zip')) { throw 'Update ZIP not found in artifact.' }
+
+      - name: Publish package and manifest
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $releaseDir='pmc-updates\releases\1.0.5'
+          New-Item -ItemType Directory -Force $releaseDir | Out-Null
+          $pkg=Join-Path $releaseDir 'PMC_Ponto_Checker_1.0.5.zip'
+          Copy-Item 'artifact\PMC_Ponto_Checker_1.0.5.zip' $pkg -Force
+          $hash=(Get-FileHash $pkg -Algorithm SHA256).Hash.ToLower()
+          $manifest=[ordered]@{
+            version='1.0.5'
+            required=$true
+            min_updater_version='1.0.0'
+            package='releases/1.0.5/PMC_Ponto_Checker_1.0.5.zip'
+            sha256=$hash
+          } | ConvertTo-Json
+          $manifest | Set-Content 'pmc-updates\manifest.json' -Encoding UTF8
+          Write-Host "Package SHA256=$hash"
+          Write-Host $manifest
+
+      - name: Commit update to public update channel
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          git config user.name 'PMC Update Bot'
+          git config user.email 'pmc-update-bot@users.noreply.github.com'
+          git add -f pmc-updates/manifest.json pmc-updates/releases/1.0.5/PMC_Ponto_Checker_1.0.5.zip
+          git commit -m 'Publish PMC Ponto Checker 1.0.5 [skip ci]'
+          git push origin HEAD:master
